@@ -1,6 +1,6 @@
 # StreamVault — Product Specification
 
-**Version:** 0.1  
+**Version:** 0.2  
 **Date:** 2026-04-25  
 **Status:** Draft
 
@@ -61,16 +61,21 @@ A single table that aggregates everything the user wants to watch.
 
 ### 3.2 Content Directory
 
-A comprehensive, searchable catalog of movies and TV shows with metadata.
+A comprehensive catalog of movies and TV shows. StreamVault operates as an intelligence layer on top of existing data sources rather than building its own catalog from scratch.
 
-**Data sourced from:**
-- Primary: TMDb (The Movie Database) API — free, comprehensive, well-maintained
-- Availability data: JustWatch API or Streaming Availability API (RapidAPI) — maps titles to platforms by region
-- Ratings: TMDb + Rotten Tomatoes (where available)
+**Data layer — availability and catalog:**
+- **TMDb API** — primary catalog source: title metadata, cast, crew, genres, ratings, trailers, upcoming season premiere dates
+- **TMDb Watch Providers endpoint** — streaming availability by region (sources from JustWatch; official, free, no agreement needed for POC)
+- Long-term: formal JustWatch data partnership as scale requires more granular or real-time availability data
+
+**Intelligence layer — content understanding:**
+- **Wikipedia API** — full plot summaries, thematic analysis, critical reception, cultural context per title
+- **Wikidata** — structured facts queryable via SPARQL: awards, "based on" relationships, similar works, cinematic movements
+- Both are ingested, cleaned, and indexed into a vector database to power the AI recommendation engine (see Section 3.3)
 
 **Metadata per title:**
 - Title, year, runtime, genres, cast, director(s)
-- Synopsis
+- Synopsis (TMDb) + full plot and themes (Wikipedia)
 - Trailer link (YouTube embed)
 - Audience and critic scores
 - Content rating (PG, R, TV-MA, etc.)
@@ -79,9 +84,18 @@ A comprehensive, searchable catalog of movies and TV shows with metadata.
 
 ---
 
-### 3.3 Mood-Based Chatbot
+### 3.3 Unified Recommendation Engine
 
-A conversational interface powered by an LLM (Claude API) that takes natural-language input about how the user is feeling and returns curated recommendations.
+Mood-based discovery and personalized recommendations are the same operation under the hood — a vector similarity search against the movie embedding space. They differ only in what generates the query vector. Both are handled by a single AI engine rather than two separate systems.
+
+**The two query types:**
+
+| Type | Query vector source | When used |
+|---|---|---|
+| Mood query | Encoded from user's free-text input right now | "I want something with a rainy Sunday feeling" |
+| Preference query | Learned from user's watchlist, ratings, behavior over time | Background recommendations, homepage suggestions |
+
+At inference time, both vectors are **blended** so results reflect the user's immediate mood *filtered through their long-term taste*. The blend weight is user-adjustable — a "surprise me" slider shifts weight toward the mood vector; "stick to my taste" shifts toward the preference vector.
 
 **Example prompts:**
 - "I want something funny but not stupid, like 30 minutes per episode"
@@ -89,17 +103,20 @@ A conversational interface powered by an LLM (Claude API) that takes natural-lan
 - "Something my 10-year-old and I can watch together tonight"
 
 **How it works:**
-1. User submits a free-text mood/preference prompt
-2. LLM interprets mood, extracts genre signals, length preference, tone, audience
-3. LLM queries the content directory (via function calling / RAG over the catalog) using those signals
-4. Returns 3–6 ranked recommendations with a one-sentence explanation for each
-5. Each result shows real-time availability on the user's active subscriptions
-6. User can add any result directly to their watchlist
+1. User submits free-text mood prompt
+2. The custom movie embedding model encodes it into a vector (same embedding space as the movie corpus)
+3. That mood vector is blended with the user's long-term preference vector
+4. Nearest-neighbor search returns the most semantically similar titles from the movie index
+5. Results are filtered and re-ranked by: availability on active subscriptions → priority → recency
+6. Claude handles natural language in and out — understanding the prompt, explaining each result in plain language
+7. Returns 3–6 results; user can add any directly to their watchlist
 
 **Constraints:**
-- Recommendations are biased toward titles available on the user's current active subscriptions first
-- User can toggle "show me everything, even if I need a subscription"
-- Chatbot remembers prior session recommendations within a conversation to avoid repeating
+- Results biased toward active subscriptions first; toggle to show all
+- Chatbot remembers prior session results to avoid repeating within a session
+- Cold-start users (no preference history) get mood-only results until enough interaction data is collected
+
+**See Section 5.1 for the full AI architecture underlying this engine.**
 
 ---
 
@@ -205,39 +222,133 @@ The most differentiated feature. The advisor analyzes the user's watchlist, subs
 
 ## 5. Technical Architecture (Proposed)
 
+### 5.1 AI Engine
+
+This is the technical core of StreamVault and the primary differentiator. It has three layers:
+
+**Layer 1 — Movie Embedding Model**
+
+A sentence transformer fine-tuned specifically on movie and TV discourse. General-purpose embedding models don't deeply understand cinematic language ("slow burn," "unreliable narrator," "feels like early Fincher"). By fine-tuning on a corpus of Wikipedia plot articles, Rotten Tomatoes reviews, Letterboxd reviews, and Reddit discussions (r/movies, r/TrueFilm), the model learns a vector space where movies that *feel* similar end up geometrically close — regardless of shared cast, director, or genre tags.
+
+- Base model: a sentence transformer (e.g., `all-MiniLM-L6-v2` or similar)
+- Fine-tuning objective: contrastive learning — pull together movies users consistently group together; push apart movies users distinguish
+- Output: one vector per title, stored in a vector database
+- All ~500K titles in the catalog are pre-embedded offline; new titles are embedded on ingest
+
+**Layer 2 — Two-Tower Recommendation Model**
+
+Two neural networks trained jointly:
+
 ```
-┌─────────────────────────────────────────────────────┐
-│                   Frontend (Web + Mobile)            │
-│   React (web) / React Native (iOS + Android)        │
-│   Tabs: Watchlist | Discover | Chatbot | Advisor     │
-└────────────────────┬────────────────────────────────┘
-                     │ REST / GraphQL
-┌────────────────────▼────────────────────────────────┐
-│                  Backend API (Node.js / FastAPI)     │
-│  - Auth (email + OAuth for social login)            │
-│  - Watchlist CRUD                                   │
-│  - Subscription manager                             │
-│  - Chatbot orchestration (Claude API)               │
-│  - Advisor engine                                   │
-│  - Notification scheduler                           │
-└──────┬──────────────────┬───────────────────────────┘
-       │                  │
-┌──────▼──────┐   ┌───────▼──────────────────────────┐
-│  Database   │   │       External APIs               │
-│  PostgreSQL │   │  - TMDb (catalog + metadata)      │
-│             │   │  - JustWatch / Streaming Avail.   │
-│             │   │  - Claude API (chatbot + advisor) │
-└─────────────┘   └──────────────────────────────────┘
+Movie tower:  movie embedding (Layer 1) ──► movie vector
+User tower:   watchlist + ratings + behavior ──► user preference vector
+```
+
+At inference time, recommendation = nearest-neighbor search: find movies whose vector is closest to the user's preference vector. Training the two towers jointly ensures the spaces align — a user who loves Korean thriller cinema ends up with a preference vector that's geometrically close to Korean thriller movie vectors.
+
+The model improves continuously as users interact: items added to watchlist, ratings given, chatbot suggestions accepted or rejected, titles watched vs. dropped all feed back into the user tower.
+
+**Layer 3 — Claude (Language In / Language Out)**
+
+Claude handles the natural language boundary:
+- Interprets the user's free-text mood prompt
+- Extracts a mood description to encode via Layer 1
+- Explains each recommendation result in a single natural sentence
+- Handles follow-up conversational turns ("something shorter," "more like the second one")
+
+Claude does not do the retrieval or ranking — that's Layers 1 and 2. Claude only handles language understanding and generation around the results.
+
+**Unified query flow:**
+
+```
+User mood prompt
+      │
+      ▼
+[Claude] extract mood intent
+      │
+      ▼
+[Layer 1] encode mood → mood vector
+      │
+      ├──────────────────────────────┐
+      │                              │
+[Layer 2] user preference vector    │
+      │                              │
+      └──────────► blend ◄──────────┘
+                     │
+                     ▼
+           nearest-neighbor search
+           (vector database)
+                     │
+                     ▼
+           filter by subscription availability
+                     │
+                     ▼
+           [Claude] explain results in plain language
+                     │
+                     ▼
+              3–6 recommendations
+```
+
+**Subscription Advisor AI:**
+
+The advisor starts as rule-based (value score = watchlist titles × priority ÷ monthly cost) and evolves into a learned model that predicts the optimal subscribe/pause schedule. Inputs include watchlist priorities, content leaving/arriving dates (time-series), historical watch velocity per user, and price per subscription. This is a sequential optimization problem — the learned version models it as a constrained scheduling task.
+
+---
+
+### 5.2 System Architecture
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                  Frontend (Web + Mobile)                  │
+│   React (web) / React Native (iOS + Android)             │
+│   Tabs: Watchlist | Discover | Chatbot | Advisor          │
+└──────────────────────┬───────────────────────────────────┘
+                       │ REST / GraphQL
+┌──────────────────────▼───────────────────────────────────┐
+│                   Backend API (FastAPI / Python)          │
+│  - Auth                    - Watchlist CRUD               │
+│  - Subscription manager    - Notification scheduler       │
+│  - Recommendation engine   - Advisor engine               │
+└───────┬──────────────────────────┬────────────────────────┘
+        │                          │
+┌───────▼───────┐       ┌──────────▼──────────────────────┐
+│   PostgreSQL  │       │         AI / Data Layer          │
+│  users        │       │  ┌─────────────────────────┐    │
+│  watchlists   │       │  │  Vector DB (Pinecone /   │    │
+│  subscriptions│       │  │  Qdrant) — movie embeddings   │
+│  interactions │       │  └─────────────────────────┘    │
+└───────────────┘       │  ┌─────────────────────────┐    │
+                        │  │  Embedding model          │    │
+                        │  │  (fine-tuned transformer) │    │
+                        │  └─────────────────────────┘    │
+                        │  ┌─────────────────────────┐    │
+                        │  │  Two-tower model          │    │
+                        │  │  (user + movie towers)    │    │
+                        │  └─────────────────────────┘    │
+                        │  ┌─────────────────────────┐    │
+                        │  │  Claude API              │    │
+                        │  │  (language in/out)        │    │
+                        │  └─────────────────────────┘    │
+                        └─────────────────────────────────┘
+                                       │
+                        ┌──────────────▼──────────────────┐
+                        │         External Data APIs       │
+                        │  - TMDb (catalog + watch provs.) │
+                        │  - Wikipedia + Wikidata           │
+                        │  - Notification: FCM + Resend    │
+                        └─────────────────────────────────┘
 ```
 
 **Key technology choices:**
-- **Frontend:** React + React Native (shared logic, separate UIs)
-- **Backend:** FastAPI (Python) or Node.js/Express
-- **Database:** PostgreSQL (relational — watchlists, subscriptions, users)
-- **LLM:** Claude API (Sonnet) for chatbot and advisor text generation
-- **Content data:** TMDb API (free tier is sufficient for MVP)
-- **Availability data:** JustWatch Streaming Availability API or similar
-- **Notifications:** Push via Firebase Cloud Messaging; email via Resend or Postmark
+- **Frontend:** React + React Native
+- **Backend:** FastAPI (Python — aligns with ML stack)
+- **Database:** PostgreSQL
+- **Vector database:** Pinecone or Qdrant (stores movie embeddings for nearest-neighbor search)
+- **Embedding model:** Fine-tuned sentence transformer (trained offline, served via API)
+- **LLM:** Claude API (Sonnet) for language understanding and generation
+- **Content data:** TMDb API (catalog + Watch Providers endpoint for availability)
+- **Content intelligence:** Wikipedia API + Wikidata SPARQL
+- **Notifications:** Firebase Cloud Messaging (push) + Resend (email)
 - **Auth:** Supabase Auth or Auth0
 
 ---
@@ -246,22 +357,29 @@ The most differentiated feature. The advisor analyzes the user's watchlist, subs
 
 The MVP focuses on the core loop: add titles, see where to watch them, get subscription advice.
 
-**In MVP:**
+**Phase 1 — MVP (validate the product):**
 - Universal watchlist (add, edit, status, recommended-by)
-- Content search via TMDb
-- Platform availability display (self-declared subscriptions via onboarding tile selection)
-- Basic chatbot (mood → recommendations from TMDb catalog)
+- Content search via TMDb + Watch Providers for availability
+- Self-declared subscription onboarding (logo tile selection)
 - Subscription manager (declare subscriptions, see monthly cost)
-- Simple advisor (rule-based: highlight watchlist titles on subscribed platforms)
+- Rule-based advisor (value score per subscription)
+- Basic chatbot: Claude interprets mood → TMDb genre/keyword search → filtered by subscriptions
+  *(no custom embeddings yet — validates whether users engage with the feature before investing in the ML stack)*
 
-**Post-MVP:**
+**Phase 2 — AI core (make it defensible):**
+- Ingest Wikipedia + Wikidata into vector database
+- Fine-tune sentence transformer on movie corpus → replace TMDb keyword search with semantic search
+- Build user preference vectors from watchlist and rating interactions
+- Deploy two-tower model; blend mood + preference vectors at inference
 - Leaving-soon alerts and notifications
-- Advanced advisor (ML-weighted value scoring)
+
+**Phase 3 — scale and polish:**
+- Learned subscription advisor (sequential optimization model)
 - Deep-link integration to streaming apps
 - Household/shared watchlists
 - Upcoming season premiere tracking
-- Mobile apps (MVP is web-first)
-- Direct platform OAuth integration for automatic subscription detection (as platforms open APIs)
+- Mobile apps (Phase 1–2 are web-first)
+- Direct platform OAuth integration (as platforms open APIs)
 
 ---
 
